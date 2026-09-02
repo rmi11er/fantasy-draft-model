@@ -37,5 +37,6 @@ test("ships a populated static fallback contract and no starter preview", async 
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(page, /manual_state\.json/);
   assert.match(page, /Record pick/);
-  assert.match(page, /Uncalibrated absolute odds/);
+  assert.match(page, /Recompute EV/);
+  assert.match(page, /Absolute odds remain uncalibrated/);
 });

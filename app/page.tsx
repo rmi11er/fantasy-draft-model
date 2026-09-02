@@ -1,10 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import {
+  recomputeDraftEV,
+  type BrowserPick,
+  type BrowserPlayer,
+  type BrowserRecommendation,
+} from "./draft-simulator";
 
-type Player = { mfl_player_id: string; name: string; position: string; team: string; display_adp: number; mean_season_points: number };
-type Pick = { overall: number; round: number; slot: number; franchise_id: string; player_id: string | null };
-type Recommendation = { rank: number; player_id: string; name: string; position: string; team: string; adp: number; payout_equity: number; marginal_ev: number; availability_probability: number };
+type Player = BrowserPlayer;
+type Pick = BrowserPick;
+type Recommendation = BrowserRecommendation;
 type Board = {
   generated_at: string;
   report: { recommendations: Recommendation[] };
@@ -22,6 +28,10 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState("");
   const [xouts, setXouts] = useState<Set<string>>(new Set());
+  const [modelRows, setModelRows] = useState<Recommendation[]>([]);
+  const [dirty, setDirty] = useState(false);
+  const [computing, setComputing] = useState(false);
+  const [modelDetail, setModelDetail] = useState("100 saved simulations");
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
@@ -30,7 +40,12 @@ export default function Home() {
       .then((payload: Board) => {
         setBoard(payload);
         setXouts(new Set(payload.xouts));
-        try { setManual(JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}")); } catch { setManual({}); }
+        setModelRows(payload.report.recommendations);
+        try {
+          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+          setManual(saved);
+          setDirty(Object.keys(saved).length > 0);
+        } catch { setManual({}); }
       })
       .catch((error: Error) => setNotice(error.message));
   }, []);
@@ -56,26 +71,51 @@ export default function Home() {
       (!needle || p.name.toLowerCase().includes(needle) || p.team.toLowerCase() === needle || p.position.toLowerCase() === needle)
     ).slice(0, 12);
   }, [board, query, taken, xouts]);
-  const recommendations = useMemo(() => (board?.report.recommendations || []).filter((p) => !taken.has(p.player_id) && !xouts.has(p.player_id)), [board, taken, xouts]);
+  const recommendations = useMemo(() => modelRows.filter((p) => !taken.has(p.player_id) && !xouts.has(p.player_id)), [modelRows, taken, xouts]);
   const latest = useMemo(() => (board?.draft_order || []).filter((pick) => pick.player_id || manual[String(pick.overall)]).map((pick) => ({ ...pick, resolved: pick.player_id || manual[String(pick.overall)] })).slice(-8).reverse(), [board, manual]);
 
   function recordPick() {
     if (!currentPick || !selected || taken.has(selected)) return;
     setManual((old) => ({ ...old, [String(currentPick.overall)]: selected }));
     setSelected(""); setQuery("");
-    setNotice("Pick recorded. Availability is updated; export and run the offline model to refresh payout EV.");
+    setDirty(true);
+    setNotice("Pick recorded. Press Recompute EV to price the new state.");
   }
   function undo() {
     const latestKey = Math.max(...Object.keys(manual).map(Number));
     if (!Number.isFinite(latestKey)) return;
     setManual((old) => { const copy = { ...old }; delete copy[String(latestKey)]; return copy; });
-    setNotice("Last manual pick removed.");
+    setDirty(true);
+    setNotice("Last manual pick removed. Recompute EV for the restored state.");
   }
   function exportState() {
     const blob = new Blob([JSON.stringify({ league_id: "50473", conference_id: "00", picks: manual }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob); const link = document.createElement("a");
     link.href = url; link.download = "manual_state.json"; link.click(); URL.revokeObjectURL(url);
     setNotice("Manual ledger downloaded for the offline model.");
+  }
+  async function recompute() {
+    if (!board || computing) return;
+    setComputing(true);
+    setNotice("Running 50 browser simulations from the current draft state…");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    try {
+      const result = recomputeDraftEV({
+        players: board.players,
+        draftOrder: board.draft_order,
+        manual,
+        xouts,
+        simulations: 50,
+      });
+      setModelRows(result.recommendations);
+      setModelDetail(`${result.simulations} browser simulations · target pick ${result.targetOverall}`);
+      setDirty(false);
+      setNotice(`EV recomputed for pick ${result.targetOverall}. Reference policy: ${result.referencePlayer}.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The browser simulation failed");
+    } finally {
+      setComputing(false);
+    }
   }
 
   if (!board) return <main className="loading"><p className="eyebrow">Levered Leopolds / Draft room</p><h1>{notice || "Loading emergency board…"}</h1></main>;
@@ -109,13 +149,17 @@ export default function Home() {
         </section>
 
         <section className="panel recs">
-          <Heading label="Model board" title="Best next policies" detail="Uncalibrated absolute odds" warning />
-          <p className="modelnote">EV is share of the 70/20/10 pool. Manual picks update availability immediately; rerun offline for conditional EV.</p>
+          <Heading label="Model board" title="Best next policies" detail={dirty ? "Recompute required" : modelDetail} warning={dirty} />
+          <p className="modelnote">EV is share of the 70/20/10 pool. Absolute odds remain uncalibrated. Browser results use 50 simulations for speed; the terminal model uses 100 and remains the more stable board.</p>
+          <div className={`recompute ${dirty ? "needs-run" : ""}`}>
+            <span>{dirty ? "Draft state changed — old probabilities are hidden." : "Probabilities match the recorded draft state."}</span>
+            <button onClick={recompute} disabled={computing || !currentPick}>{computing ? "Simulating…" : "Recompute EV"}</button>
+          </div>
           {recommendations.map((row, index) => <article className="recommendation" key={row.player_id}>
             <span className="rank">{index + 1}</span><Identity name={row.name} detail={`${row.position} · ${row.team} · ADP ${row.adp.toFixed(1)}`} />
-            <div className="ev"><strong>{pct(row.payout_equity)}</strong><small>{row.marginal_ev >= 0 ? "+" : ""}{(row.marginal_ev * 100).toFixed(1)} pp</small></div>
-            <div className="avail"><i style={{ width: pct(row.availability_probability) }} /><small>{pct(row.availability_probability)} avail.</small></div>
-            <button className="x" onClick={() => setXouts((old) => new Set(old).add(row.player_id))} aria-label={`X out ${row.name}`}>×</button>
+            <div className="ev"><strong>{dirty ? "—" : pct(row.payout_equity)}</strong><small>{dirty ? "stale" : `${row.marginal_ev >= 0 ? "+" : ""}${(row.marginal_ev * 100).toFixed(1)} pp`}</small></div>
+            <div className="avail"><i style={{ width: dirty ? "0%" : pct(row.availability_probability) }} /><small>{dirty ? "recompute" : `${pct(row.availability_probability)} avail.`}</small></div>
+            <button className="x" onClick={() => { setXouts((old) => new Set(old).add(row.player_id)); setDirty(true); setNotice(`${row.name} X’d out. Recompute EV for the reduced pool.`); }} aria-label={`X out ${row.name}`}>×</button>
           </article>)}
         </section>
 

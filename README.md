@@ -49,8 +49,9 @@ npm run dev
 The browser board records the conference in authoritative pick order, removes
 selected or X'd-out players immediately, supports undo, and exports the same
 `manual_state.json` consumed by the offline model. Browser edits are local to
-that device. Filtering is immediate, but a Python offline refresh is required
-to recompute conditional payout EV after manual picks.
+that device. Its **Recompute EV** button runs a self-contained 50-simulation
+version of the draft model from the recorded state. The terminal command uses
+100 simulations and remains the more stable decision board.
 
 ## Verification
 
