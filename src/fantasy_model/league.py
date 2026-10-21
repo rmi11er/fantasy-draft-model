@@ -41,6 +41,9 @@ class LeagueSnapshot:
     picks: tuple[DraftPick, ...]
     rostered_player_ids: frozenset[str] = frozenset()
     my_rostered_player_ids: tuple[str, ...] = ()
+    external_conference_franchise_ids: tuple[str, ...] = ()
+    external_picks: tuple[DraftPick, ...] = ()
+    external_rostered_player_ids: frozenset[str] = frozenset()
 
     @property
     def my_picks(self) -> tuple[DraftPick, ...]:
@@ -130,27 +133,58 @@ class LeagueSnapshot:
         }
 
         units = _as_list(draft_payload["draftResults"]["draftUnit"])
-        unit = next(
-            item for item in units if item["unit"] == f"CONFERENCE{conference_id}"
-        )
-        raw_picks = _as_list(unit.get("draftPick"))
-        conference_franchise_ids = tuple(
-            item["id"]
-            for item in franchises
-            if divisions[item["division"]]["conference"] == conference_id
-        )
-        team_count = len(conference_franchise_ids)
-        picks = tuple(sorted((
-            DraftPick(
-                overall=(int(item["round"]) - 1) * team_count + int(item["pick"]),
-                round=int(item["round"]),
-                slot=int(item["pick"]),
-                franchise_id=item["franchise"],
-                player_id=item.get("player") or None,
-                timestamp=item.get("timestamp") or None,
+
+        def conference_franchises(selected_conference_id: str) -> tuple[str, ...]:
+            return tuple(
+                item["id"]
+                for item in franchises
+                if divisions[item["division"]]["conference"]
+                == selected_conference_id
             )
-            for item in raw_picks
-        ), key=lambda pick: pick.overall))
+
+        def conference_picks(selected_conference_id: str) -> tuple[DraftPick, ...]:
+            unit = next(
+                item
+                for item in units
+                if item["unit"] == f"CONFERENCE{selected_conference_id}"
+            )
+            team_count = len(conference_franchises(selected_conference_id))
+            return tuple(
+                sorted(
+                    (
+                        DraftPick(
+                            overall=(int(item["round"]) - 1) * team_count
+                            + int(item["pick"]),
+                            round=int(item["round"]),
+                            slot=int(item["pick"]),
+                            franchise_id=item["franchise"],
+                            player_id=item.get("player") or None,
+                            timestamp=item.get("timestamp") or None,
+                        )
+                        for item in _as_list(unit.get("draftPick"))
+                    ),
+                    key=lambda pick: pick.overall,
+                )
+            )
+
+        conference_franchise_ids = conference_franchises(conference_id)
+        picks = conference_picks(conference_id)
+        external_conference_ids = tuple(
+            selected_id for selected_id in conferences if selected_id != conference_id
+        )
+        external_conference_id = (
+            external_conference_ids[0] if len(external_conference_ids) == 1 else None
+        )
+        external_conference_franchise_ids = (
+            conference_franchises(external_conference_id)
+            if external_conference_id is not None
+            else ()
+        )
+        external_picks = (
+            conference_picks(external_conference_id)
+            if external_conference_id is not None
+            else ()
+        )
 
         rostered_by_franchise: dict[str, tuple[str, ...]] = {}
         if roster_payload:
@@ -168,6 +202,12 @@ class LeagueSnapshot:
             if roster_franchise in conference_franchise_ids
             for player_id in player_ids
         )
+        external_rostered = frozenset(
+            player_id
+            for roster_franchise, player_ids in rostered_by_franchise.items()
+            if roster_franchise in external_conference_franchise_ids
+            for player_id in player_ids
+        )
 
         return cls(
             league_id=league["id"],
@@ -182,6 +222,9 @@ class LeagueSnapshot:
             picks=picks,
             rostered_player_ids=conference_rostered,
             my_rostered_player_ids=rostered_by_franchise.get(franchise["id"], ()),
+            external_conference_franchise_ids=external_conference_franchise_ids,
+            external_picks=external_picks,
+            external_rostered_player_ids=external_rostered,
         )
 
 

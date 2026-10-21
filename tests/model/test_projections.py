@@ -138,6 +138,7 @@ def test_all_player_projection_sources_and_distribution_contract() -> None:
         "mean_season_points",
         "sd_weekly_points",
         "sd_season_points",
+        "season_uncertainty_method",
         "source",
         "adp",
     } <= set(projected.columns)
@@ -146,6 +147,8 @@ def test_all_player_projection_sources_and_distribution_contract() -> None:
     assert rookie["source"] == "rookie_draft_capital"
     assert rookie["mean_weekly_points"] == 10.0
     assert rookie["mean_season_points"] == 170.0
+    assert rookie["sd_season_points"] == 65.07
+    assert rookie["season_uncertainty_method"] == "rookie_walk_forward_residual_band"
     assert rookie["adp"] == 3.5
 
     veteran = projected.filter(pl.col("mfl_player_id") == "v1").row(0, named=True)
@@ -154,6 +157,7 @@ def test_all_player_projection_sources_and_distribution_contract() -> None:
     unknown = projected.filter(pl.col("mfl_player_id") == "u1").row(0, named=True)
     assert veteran["source"] == "veteran_recency_shrink"
     assert veteran["mean_season_points"] > 0
+    assert veteran["season_uncertainty_method"] == "veteran_conformal_2020_2025"
     assert kicker["source"] == "veteran_recency_shrink"
     assert kicker["mean_season_points"] > 0
     assert defense["source"] == "defense_neutral_prior"
@@ -193,4 +197,3 @@ def test_rookie_join_requires_unambiguous_stable_id() -> None:
         assert "duplicate espn_id" in str(error)
     else:
         raise AssertionError("ambiguous rookie mapping should be rejected")
-

@@ -12,6 +12,7 @@ test("browser simulator prices the user's next pick from static state", () => {
   const result = recomputeDraftEV({
     players: board.players,
     draftOrder: board.draft_order,
+    externalDraftOrder: board.external_draft_order,
     manual: {},
     xouts: new Set(board.xouts),
     simulations: 5,
@@ -19,6 +20,9 @@ test("browser simulator prices the user's next pick from static state", () => {
   assert.equal(result.targetOverall, 2);
   assert.equal(result.recommendations.length, 8);
   assert.ok(result.recommendations.every((row) => row.payout_equity >= 0));
+  assert.ok(result.recommendations[0].statistically_tied_for_best);
+  assert.equal(result.recommendations[0].best_ev_gap_standard_error, 0);
+  assert.ok(result.recommendations.every((row) => row.marginal_ev_standard_error >= 0));
 });
 
 test("manual 1.01 changes the available pool before recomputation", () => {
@@ -26,6 +30,7 @@ test("manual 1.01 changes the available pool before recomputation", () => {
   const result = recomputeDraftEV({
     players: board.players,
     draftOrder: board.draft_order,
+    externalDraftOrder: board.external_draft_order,
     manual: { "1": gibbs.mfl_player_id },
     xouts: new Set(board.xouts),
     simulations: 10,
@@ -33,4 +38,5 @@ test("manual 1.01 changes the available pool before recomputation", () => {
   assert.equal(result.targetOverall, 2);
   assert.ok(result.recommendations.every((row) => row.player_id !== gibbs.mfl_player_id));
   assert.equal(result.recommendations[0].availability_probability, 1);
+  assert.ok(new Set(result.recommendations.map((row) => row.payout_equity.toFixed(6))).size > 1);
 });

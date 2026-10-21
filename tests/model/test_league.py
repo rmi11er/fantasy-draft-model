@@ -77,6 +77,8 @@ def test_snapshot_scopes_drafted_players_to_my_conference() -> None:
     assert "16162" in snapshot.drafted_player_ids
     assert "16580" not in snapshot.drafted_player_ids
     assert snapshot.is_available("16580")
+    assert snapshot.external_conference_franchise_ids == ("0017", "0013")
+    assert snapshot.external_picks[0].player_id == "16580"
 
 
 def test_snake_pick_numbers_are_derived_from_draft_unit() -> None:
@@ -114,6 +116,7 @@ def test_rostered_players_in_my_conference_are_unavailable() -> None:
     assert not snapshot.is_available("keeper-b")
     assert snapshot.is_available("other-conference")
     assert snapshot.my_player_ids == ("keeper-b",)
+    assert snapshot.external_rostered_player_ids == frozenset({"other-conference"})
 
 
 def test_skipped_empty_pick_does_not_reopen_after_later_selection() -> None:

@@ -29,6 +29,9 @@ export type BrowserRecommendation = {
   first_probability: number;
   second_probability: number;
   third_probability: number;
+  marginal_ev_standard_error: number;
+  best_ev_gap_standard_error: number;
+  statistically_tied_for_best: boolean;
 };
 
 export type BrowserSimulationResult = {
@@ -54,6 +57,7 @@ type Equity = {
   third: number;
   availability: number;
   commonSelection: string;
+  payoutSamples: number[];
 };
 
 const POSITIONS: Position[] = ["QB", "RB", "WR", "TE", "PK", "DEF"];
@@ -86,6 +90,14 @@ function normal(random: () => number) {
   const first = Math.max(random(), Number.EPSILON);
   const second = random();
   return Math.sqrt(-2 * Math.log(first)) * Math.cos(2 * Math.PI * second);
+}
+
+function pairedStandardError(first: number[], second: number[]) {
+  if (first.length < 2 || first.length !== second.length) return 0;
+  const differences = first.map((value, index) => value - second[index]);
+  const mean = differences.reduce((total, value) => total + value, 0) / differences.length;
+  const variance = differences.reduce((total, value) => total + (value - mean) ** 2, 0) / (differences.length - 1);
+  return Math.sqrt(variance / differences.length);
 }
 
 function counts(roster: string[], byId: Map<string, Player>) {
@@ -157,12 +169,14 @@ function selectPlayerPool(allPlayers: BrowserPlayer[], required: Set<string>) {
 export function recomputeDraftEV({
   players: allPlayers,
   draftOrder,
+  externalDraftOrder = [],
   manual,
   xouts,
   simulations = 60,
 }: {
   players: BrowserPlayer[];
   draftOrder: BrowserPick[];
+  externalDraftOrder?: BrowserPick[];
   manual: Record<string, string>;
   xouts: Set<string>;
   simulations?: number;
@@ -179,20 +193,44 @@ export function recomputeDraftEV({
   const target = future.find((pick) => pick.franchise_id === USER_ID);
   if (!target) throw new Error("Levered Leopolds has no remaining pick");
 
-  const players = selectPlayerPool(allPlayers, filledIds);
+  const externalFilled = new Map<number, string>();
+  externalDraftOrder.forEach((pick) => {
+    if (pick.player_id) externalFilled.set(pick.overall, pick.player_id);
+  });
+  const externalFilledIds = new Set(externalFilled.values());
+  if (externalFilledIds.size !== externalFilled.size) throw new Error("The other conference contains a duplicate player");
+  const externalHighestFilled = Math.max(0, ...externalFilled.keys());
+  const externalFuture = externalDraftOrder.filter((pick) => pick.overall > externalHighestFilled);
+
+  const requiredIds = new Set([...filledIds, ...externalFilledIds]);
+  const players = selectPlayerPool(allPlayers, requiredIds);
   const byId = new Map(players.map((player) => [player.mfl_player_id, player]));
   const franchises = [...new Set(draftOrder.map((pick) => pick.franchise_id))];
   if (franchises.length !== 10) throw new Error("The static simulator requires ten conference franchises");
-  const franchiseIndex = new Map(franchises.map((id, index) => [id, index]));
+  const externalFranchises = [...new Set(externalDraftOrder.map((pick) => pick.franchise_id))];
+  const hasExactExternal = externalFranchises.length === 10;
+  if (externalDraftOrder.length && !hasExactExternal) throw new Error("The other conference must contain ten franchises");
+  const allFranchises = [...franchises, ...externalFranchises];
+  const franchiseIndex = new Map(allFranchises.map((id, index) => [id, index]));
   const rosters: Record<string, string[]> = Object.fromEntries(franchises.map((id) => [id, []]));
   filled.forEach((playerId, overall) => {
     const slot = draftOrder.find((pick) => pick.overall === overall)!;
     if (!byId.has(playerId)) throw new Error(`Picked player ${playerId} is outside the simulation pool`);
     rosters[slot.franchise_id].push(playerId);
   });
+  const externalRosters: Record<string, string[]> = Object.fromEntries(externalFranchises.map((id) => [id, []]));
+  externalFilled.forEach((playerId, overall) => {
+    const slot = externalDraftOrder.find((pick) => pick.overall === overall)!;
+    if (!byId.has(playerId)) throw new Error(`Other-conference player ${playerId} is outside the simulation pool`);
+    externalRosters[slot.franchise_id].push(playerId);
+  });
   const picksAfter = new Map(future.map((slot) => [
     slot.overall,
     future.filter((later) => later.overall > slot.overall && later.franchise_id === slot.franchise_id).length,
+  ]));
+  const externalPicksAfter = new Map(externalFuture.map((slot) => [
+    slot.overall,
+    externalFuture.filter((later) => later.overall > slot.overall && later.franchise_id === slot.franchise_id).length,
   ]));
 
   const replacement: Record<Position, number> = { QB: 0, RB: 0, WR: 0, TE: 0, PK: 0, DEF: 0 };
@@ -213,19 +251,61 @@ export function recomputeDraftEV({
   });
 
   const random = mulberry32(50_473 + highestFilled * 997);
-  const scenarios: Scenario[] = Array.from({ length: simulations }, () => {
-    const noise = new Float32Array(franchises.length * players.length);
+  const scenarios: Scenario[] = [];
+  while (scenarios.length < simulations) {
+    const noise = new Float32Array(allFranchises.length * players.length);
     const outcomes = new Float32Array(players.length);
     for (let index = 0; index < noise.length; index += 1) noise[index] = normal(random) * 0.38;
     for (let index = 0; index < outcomes.length; index += 1) outcomes[index] = normal(random);
-    const externalScenarios = new Uint16Array(FIELD_SIZE - franchises.length);
-    const externalOpponents = new Uint8Array(FIELD_SIZE - franchises.length);
-    for (let index = 0; index < externalScenarios.length; index += 1) {
-      externalScenarios[index] = Math.floor(random() * simulations);
-      externalOpponents[index] = Math.floor(random() * (franchises.length - 1));
+    const externalIndices = (scenarioIndex: number) => {
+      const externalScenarios = new Uint16Array(FIELD_SIZE - franchises.length);
+      const externalOpponents = new Uint8Array(FIELD_SIZE - franchises.length);
+      for (let index = 0; index < externalScenarios.length; index += 1) {
+        externalScenarios[index] = (scenarioIndex + Math.floor(((index + 1) * simulations) / (externalScenarios.length + 1))) % simulations;
+        externalOpponents[index] = (scenarioIndex + index) % (franchises.length - 1);
+      }
+      return { externalScenarios, externalOpponents };
     }
-    return { noise, outcomes, externalScenarios, externalOpponents };
-  });
+    const { externalScenarios, externalOpponents } = externalIndices(scenarios.length);
+    scenarios.push({ noise, outcomes, externalScenarios, externalOpponents });
+    if (scenarios.length < simulations) {
+      const pairedExternal = externalIndices(scenarios.length);
+      scenarios.push({
+        noise: Float32Array.from(noise, (value) => -value),
+        outcomes: Float32Array.from(outcomes, (value) => -value),
+        ...pairedExternal,
+      });
+    }
+  }
+
+  const exactExternalScoreRows: Record<string, number>[] = hasExactExternal
+    ? scenarios.map((scenario) => {
+      const scenarioRosters: Record<string, string[]> = Object.fromEntries(
+        externalFranchises.map((id) => [id, [...externalRosters[id]]]),
+      );
+      const selectedIds = new Set(externalFilledIds);
+      externalFuture.forEach((slot) => {
+        const roster = scenarioRosters[slot.franchise_id];
+        const remaining = externalPicksAfter.get(slot.overall) || 0;
+        const availablePlayers = players.filter((player) =>
+          !selectedIds.has(player.mfl_player_id)
+          && feasible(player.positionKey, roster, remaining, byId)
+        );
+        if (!availablePlayers.length) throw new Error(`No legal other-conference player remains for pick ${slot.overall}`);
+        const team = franchiseIndex.get(slot.franchise_id)!;
+        const choice = availablePlayers.reduce((best, player) => {
+          const playerScore = Math.log(player.display_adp) + scenario.noise[team * players.length + player.index];
+          const bestScore = Math.log(best.display_adp) + scenario.noise[team * players.length + best.index];
+          return playerScore < bestScore ? player : best;
+        });
+        roster.push(choice.mfl_player_id);
+        selectedIds.add(choice.mfl_player_id);
+      });
+      return Object.fromEntries(
+        externalFranchises.map((id) => [id, rosterScore(scenarioRosters[id], scenario, byId)]),
+      );
+    })
+    : [];
 
   function equity(forcedId: string | null): Equity {
     const scoreRows: Record<string, number>[] = [];
@@ -239,7 +319,8 @@ export function recomputeDraftEV({
         const roster = scenarioRosters[slot.franchise_id];
         const remaining = picksAfter.get(slot.overall) || 0;
         const availablePlayers = players.filter((player) =>
-          !selectedIds.has(player.mfl_player_id) && !xouts.has(player.mfl_player_id)
+          !selectedIds.has(player.mfl_player_id)
+          && (slot.franchise_id !== USER_ID || !xouts.has(player.mfl_player_id))
           && feasible(player.positionKey, roster, remaining, byId)
         );
         if (!availablePlayers.length) throw new Error(`No legal player remains for pick ${slot.overall}`);
@@ -270,25 +351,37 @@ export function recomputeDraftEV({
 
     const opponentIds = franchises.filter((id) => id !== USER_ID);
     let first = 0; let second = 0; let third = 0; let payout = 0;
+    const payoutSamples: number[] = [];
     scenarios.forEach((scenario, scenarioIndex) => {
       const ourScore = scoreRows[scenarioIndex][USER_ID];
       const opponents = opponentIds.map((id) => scoreRows[scenarioIndex][id]);
-      for (let index = 0; index < scenario.externalScenarios.length; index += 1) {
-        opponents.push(scoreRows[scenario.externalScenarios[index]][opponentIds[scenario.externalOpponents[index]]]);
+      if (hasExactExternal) {
+        externalFranchises.forEach((id) => opponents.push(exactExternalScoreRows[scenarioIndex][id]));
+      } else {
+        for (let index = 0; index < scenario.externalScenarios.length; index += 1) {
+          opponents.push(scoreRows[scenario.externalScenarios[index]][opponentIds[scenario.externalOpponents[index]]]);
+        }
       }
       const greater = opponents.filter((score) => score > ourScore).length;
       const tied = 1 + opponents.filter((score) => score === ourScore).length;
       const share = (place: number) => place > greater && place <= greater + tied ? 1 / tied : 0;
       first += share(1); second += share(2); third += share(3);
-      payout += share(1) * 0.7 + share(2) * 0.2 + share(3) * 0.1;
+      const scenarioPayout = share(1) * 0.7 + share(2) * 0.2 + share(3) * 0.1;
+      payout += scenarioPayout;
+      payoutSamples.push(scenarioPayout);
     });
     const commonSelection = [...selections.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "";
-    return { payout: payout / simulations, first: first / simulations, second: second / simulations, third: third / simulations, availability: available / simulations, commonSelection };
+    return { payout: payout / simulations, first: first / simulations, second: second / simulations, third: third / simulations, availability: available / simulations, commonSelection, payoutSamples };
   }
 
   const reference = equity(null);
-  const recommendations = candidates.map((candidate) => {
+  const priced = candidates.map((candidate) => {
     const result = equity(candidate.mfl_player_id);
+    return { candidate, result };
+  }).sort((a, b) => b.result.payout - a.result.payout || a.candidate.display_adp - b.candidate.display_adp);
+  const best = priced[0].result;
+  const recommendations = priced.map(({ candidate, result }) => {
+    const bestGapStandardError = pairedStandardError(result.payoutSamples, best.payoutSamples);
     return {
       rank: 0,
       player_id: candidate.mfl_player_id,
@@ -302,9 +395,11 @@ export function recomputeDraftEV({
       first_probability: result.first,
       second_probability: result.second,
       third_probability: result.third,
+      marginal_ev_standard_error: pairedStandardError(result.payoutSamples, reference.payoutSamples),
+      best_ev_gap_standard_error: bestGapStandardError,
+      statistically_tied_for_best: best.payout - result.payout <= 1.96 * bestGapStandardError,
     };
-  }).sort((a, b) => b.payout_equity - a.payout_equity || a.adp - b.adp)
-    .map((row, index) => ({ ...row, rank: index + 1 }));
+  }).map((row, index) => ({ ...row, rank: index + 1 }));
 
   return {
     recommendations,

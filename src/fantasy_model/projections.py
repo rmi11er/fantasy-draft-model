@@ -17,6 +17,11 @@ from dataclasses import dataclass
 import polars as pl
 
 from .backtest import POSITIONS, add_league_points
+from .distribution_constants import (
+    VETERAN_SEASON_SD_MULTIPLIER,
+    calibrated_rookie_sd,
+    calibrated_veteran_mean_adjustment,
+)
 
 
 MFL_POSITIONS = (*POSITIONS, "PK", "Def")
@@ -34,15 +39,16 @@ class ProjectionAssumptions:
     Veteran PPG is shrunk by ``production_prior_games`` toward the prior-season
     positional median. Expected games is shrunk by ``availability_prior_seasons``
     toward a conservative positional availability assumption.  Season standard
-    deviation uses an independent-week square-root-of-time approximation; a
-    downstream simulator should replace that approximation with explicit injury
-    and role scenarios when those inputs are available.
+    deviation begins with an independent-week square-root-of-time approximation,
+    then receives position-specific conformal calibration for preseason role,
+    injury, and availability error. Rookie season uncertainty uses walk-forward
+    residual production bands rather than the much narrower weekly-volatility SD.
     """
 
     season_weeks: int = 17
     rookie_baseline_weeks: int = 14
-    production_prior_games: float = 6.0
-    availability_prior_seasons: float = 1.0
+    production_prior_games: float = 3.0
+    availability_prior_seasons: float = 0.5
     qb_expected_games: float = 15.0
     rb_expected_games: float = 14.0
     wr_expected_games: float = 14.5
@@ -323,11 +329,16 @@ def build_all_player_projections(
     )
     _validate_unique_nonempty(universe, "mfl_player_id", "MFL universe")
 
-    identity = (
-        nflverse_players.select(
+    identity_expressions: list[pl.Expr] = [
             pl.col("gsis_id").cast(pl.String).alias("nflverse_player_id"),
             pl.col("espn_id").cast(pl.String).fill_null("").alias("espn_id"),
-        )
+    ]
+    if "birth_date" in nflverse_players.columns:
+        identity_expressions.append(pl.col("birth_date").cast(pl.String))
+    else:
+        identity_expressions.append(pl.lit(None, dtype=pl.String).alias("birth_date"))
+    identity = (
+        nflverse_players.select(identity_expressions)
         .filter(pl.col("nflverse_player_id").is_not_null())
     )
     _validate_unique_nonempty(identity, "espn_id", "nflverse player identity")
@@ -375,12 +386,28 @@ def build_all_player_projections(
     is_rookie = pl.col("rookie_baseline_points").is_not_null()
     has_history = pl.col("historical_active_ppg").is_not_null()
     is_defense = pl.col("mfl_position") == "Def"
+    player_age = (
+        pl.lit(target_season)
+        - pl.col("birth_date").str.to_date(strict=False).dt.year()
+    ).cast(pl.Float64)
+    veteran_mean_adjustment = (
+        pl.struct(
+            pl.col("mfl_position"),
+            player_age.alias("player_age"),
+        )
+        .map_elements(
+            lambda row: calibrated_veteran_mean_adjustment(
+                row["mfl_position"], row["player_age"]
+            ),
+            return_dtype=pl.Float64,
+        )
+    )
 
     # Rookies' predicted weeks 1-14 points already include role and availability.
     # Veteran weekly mean is made unconditional by multiplying active PPG by the
     # projected availability rate. Unknowns stay at zero rather than receiving an
     # unjustified sleeper boost.
-    mean_weekly = (
+    unadjusted_mean_weekly = (
         pl.when(is_rookie)
         .then(pl.col("rookie_baseline_points") / assumptions.rookie_baseline_weeks)
         .when(has_history)
@@ -393,6 +420,12 @@ def build_all_player_projections(
         .then(assumptions.defense_weekly_mean)
         .otherwise(0.0)
     )
+    mean_weekly = (
+        unadjusted_mean_weekly
+        + pl.when(has_history & ~is_rookie)
+        .then(veteran_mean_adjustment / assumptions.season_weeks)
+        .otherwise(0.0)
+    ).clip(0.0, None)
     weekly_sd = (
         pl.when(is_rookie)
         .then(
@@ -414,7 +447,7 @@ def build_all_player_projections(
                     pl.col("historical_active_sd").pow(2)
                     + pl.col("historical_active_ppg").pow(2)
                 )
-                - mean_weekly.pow(2)
+                - unadjusted_mean_weekly.pow(2)
             )
             .clip(0.0, None)
             .sqrt()
@@ -436,6 +469,12 @@ def build_all_player_projections(
             .then(pl.lit("defense_neutral_prior"))
             .otherwise(pl.lit("unmatched_zero_prior"))
             .alias("source"),
+            player_age.round(2).alias("player_age"),
+            pl.when(has_history & ~is_rookie)
+            .then(veteran_mean_adjustment)
+            .otherwise(0.0)
+            .round(2)
+            .alias("mean_adjustment_points"),
         )
         .with_columns(
             (pl.col("mean_weekly_points") * assumptions.season_weeks)
@@ -443,7 +482,38 @@ def build_all_player_projections(
             .alias("mean_season_points"),
             (pl.col("sd_weekly_points") * assumptions.season_weeks**0.5)
             .round(2)
+            .alias("raw_sd_season_points"),
+        )
+        .with_columns(
+            pl.when(is_rookie)
+            .then(
+                pl.struct("mfl_position", "mean_season_points").map_elements(
+                    lambda row: calibrated_rookie_sd(
+                        row["mfl_position"], row["mean_season_points"]
+                    ),
+                    return_dtype=pl.Float64,
+                )
+            )
+            .when(has_history)
+            .then(
+                pl.col("raw_sd_season_points")
+                * pl.col("mfl_position").replace_strict(
+                    VETERAN_SEASON_SD_MULTIPLIER,
+                    default=1.0,
+                    return_dtype=pl.Float64,
+                )
+            )
+            .otherwise(pl.col("raw_sd_season_points"))
+            .round(2)
             .alias("sd_season_points"),
+            pl.when(is_rookie)
+            .then(pl.lit("rookie_walk_forward_residual_band"))
+            .when(has_history)
+            .then(pl.lit("veteran_conformal_2020_2025"))
+            .when(is_defense)
+            .then(pl.lit("defense_uncalibrated_prior"))
+            .otherwise(pl.lit("no_uncertainty"))
+            .alias("season_uncertainty_method"),
         )
         .select(
             "mfl_player_id",
@@ -454,6 +524,9 @@ def build_all_player_projections(
             "mean_season_points",
             "sd_weekly_points",
             "sd_season_points",
+            "season_uncertainty_method",
+            "player_age",
+            "mean_adjustment_points",
             "source",
             pl.col("average_pick").cast(pl.Float64).alias("adp"),
             "adp_rank",

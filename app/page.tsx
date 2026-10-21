@@ -15,12 +15,15 @@ type Board = {
   generated_at: string;
   report: { recommendations: Recommendation[] };
   draft_order: Pick[];
+  external_draft_order?: Pick[];
   players: Player[];
   xouts: string[];
 };
 
 const STORAGE_KEY = "levered-leopolds-manual-draft-v1";
+const XOUT_STORAGE_KEY = "levered-leopolds-xouts-v1";
 const pct = (value: number) => `${(value * 100).toFixed(1)}%`;
+const precisePct = (value: number) => `${(value * 100).toFixed(2)}%`;
 
 export default function Home() {
   const [board, setBoard] = useState<Board | null>(null);
@@ -33,24 +36,37 @@ export default function Home() {
   const [computing, setComputing] = useState(false);
   const [modelDetail, setModelDetail] = useState("100 saved simulations");
   const [notice, setNotice] = useState("");
+  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     fetch("/draft-board.json")
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("Draft data unavailable")))
       .then((payload: Board) => {
         setBoard(payload);
-        setXouts(new Set(payload.xouts));
         setModelRows(payload.report.recommendations);
+        let savedManual: Record<string, string> = {};
+        let savedXouts: string[] = [];
         try {
-          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-          setManual(saved);
-          setDirty(Object.keys(saved).length > 0);
-        } catch { setManual({}); }
+          savedManual = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+        } catch { savedManual = {}; }
+        try {
+          const parsed = JSON.parse(localStorage.getItem(XOUT_STORAGE_KEY) || "[]");
+          savedXouts = Array.isArray(parsed) ? parsed.map(String) : [];
+        } catch { savedXouts = []; }
+        setManual(savedManual);
+        setXouts(new Set([...payload.xouts, ...savedXouts]));
+        setDirty(Object.keys(savedManual).length > 0);
+        setHydrated(true);
       })
       .catch((error: Error) => setNotice(error.message));
   }, []);
 
-  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(manual)); }, [manual]);
+  useEffect(() => {
+    if (hydrated) localStorage.setItem(STORAGE_KEY, JSON.stringify(manual));
+  }, [hydrated, manual]);
+  useEffect(() => {
+    if (hydrated) localStorage.setItem(XOUT_STORAGE_KEY, JSON.stringify([...xouts]));
+  }, [hydrated, xouts]);
 
   const playerById = useMemo(() => new Map(board?.players.map((p) => [p.mfl_player_id, p]) || []), [board]);
   const taken = useMemo(() => {
@@ -64,13 +80,14 @@ export default function Home() {
     const done = board.draft_order.filter((pick) => pick.player_id || manual[String(pick.overall)]).map((pick) => pick.overall);
     return board.draft_order.find((pick) => pick.overall === Math.max(0, ...done) + 1) || null;
   }, [board, manual]);
+  const onClock = currentPick?.franchise_id === "0016";
   const results = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return (board?.players || []).filter((p) =>
-      !taken.has(p.mfl_player_id) && !xouts.has(p.mfl_player_id) &&
+      !taken.has(p.mfl_player_id) &&
       (!needle || p.name.toLowerCase().includes(needle) || p.team.toLowerCase() === needle || p.position.toLowerCase() === needle)
     ).slice(0, 12);
-  }, [board, query, taken, xouts]);
+  }, [board, query, taken]);
   const recommendations = useMemo(() => modelRows.filter((p) => !taken.has(p.player_id) && !xouts.has(p.player_id)), [modelRows, taken, xouts]);
   const latest = useMemo(() => (board?.draft_order || []).filter((pick) => pick.player_id || manual[String(pick.overall)]).map((pick) => ({ ...pick, resolved: pick.player_id || manual[String(pick.overall)] })).slice(-8).reverse(), [board, manual]);
 
@@ -103,6 +120,7 @@ export default function Home() {
       const result = recomputeDraftEV({
         players: board.players,
         draftOrder: board.draft_order,
+        externalDraftOrder: board.external_draft_order,
         manual,
         xouts,
         simulations: 50,
@@ -141,7 +159,7 @@ export default function Home() {
           <div className="results">
             {results.map((player) => <button key={player.mfl_player_id} className={`player ${selected === player.mfl_player_id ? "selected" : ""}`} onClick={() => setSelected(player.mfl_player_id)}>
               <span className={`pos ${player.position.toLowerCase()}`}>{player.position}</span>
-              <Identity name={player.name} detail={`${player.team} · ADP ${player.display_adp.toFixed(1)}`} />
+              <Identity name={player.name} detail={`${player.team} · ADP ${player.display_adp.toFixed(1)}${xouts.has(player.mfl_player_id) ? " · X’d for you" : ""}`} />
               <small>{player.mean_season_points.toFixed(0)} pts</small>
             </button>)}
           </div>
@@ -150,15 +168,16 @@ export default function Home() {
 
         <section className="panel recs">
           <Heading label="Model board" title="Best next policies" detail={dirty ? "Recompute required" : modelDetail} warning={dirty} />
-          <p className="modelnote">EV is share of the 70/20/10 pool. Absolute odds remain uncalibrated. Browser results use 50 simulations for speed; the terminal model uses 100 and remains the more stable board.</p>
+          <p className="modelnote">EV is share of the 70/20/10 pool. Absolute odds remain uncalibrated. Browser results use 50 paired simulations for speed; “top tier” means Monte Carlo noise cannot separate that player from the leader at 95%.</p>
           <div className={`recompute ${dirty ? "needs-run" : ""}`}>
             <span>{dirty ? "Draft state changed — old probabilities are hidden." : "Probabilities match the recorded draft state."}</span>
             <button onClick={recompute} disabled={computing || !currentPick}>{computing ? "Simulating…" : "Recompute EV"}</button>
           </div>
+          <div className="metriclabels"><span>Prize EV</span><span>Availability</span></div>
           {recommendations.map((row, index) => <article className="recommendation" key={row.player_id}>
-            <span className="rank">{index + 1}</span><Identity name={row.name} detail={`${row.position} · ${row.team} · ADP ${row.adp.toFixed(1)}`} />
-            <div className="ev"><strong>{dirty ? "—" : pct(row.payout_equity)}</strong><small>{dirty ? "stale" : `${row.marginal_ev >= 0 ? "+" : ""}${(row.marginal_ev * 100).toFixed(1)} pp`}</small></div>
-            <div className="avail"><i style={{ width: dirty ? "0%" : pct(row.availability_probability) }} /><small>{dirty ? "recompute" : `${pct(row.availability_probability)} avail.`}</small></div>
+            <span className="rank">{displayRank(recommendations, index)}</span><Identity name={row.name} detail={`${row.position} · ${row.team} · ADP ${row.adp.toFixed(1)}`} />
+            <div className="ev"><strong>{dirty ? "—" : precisePct(row.payout_equity)}</strong><small>{dirty ? "stale" : `${row.marginal_ev >= 0 ? "+" : ""}${(row.marginal_ev * 100).toFixed(2)} pp${row.statistically_tied_for_best ? " · top tier" : ""}`}</small></div>
+            <div className="avail"><i style={{ width: dirty ? "0%" : onClock ? "100%" : pct(row.availability_probability) }} /><small>{dirty ? "recompute" : onClock ? "available now" : `${pct(row.availability_probability)} avail.`}</small></div>
             <button className="x" onClick={() => { setXouts((old) => new Set(old).add(row.player_id)); setDirty(true); setNotice(`${row.name} X’d out. Recompute EV for the reduced pool.`); }} aria-label={`X out ${row.name}`}>×</button>
           </article>)}
         </section>
@@ -181,4 +200,11 @@ function Heading({ label, title, detail, warning = false }: { label: string; tit
 }
 function Identity({ name, detail }: { name: string; detail: string }) {
   return <span className="identity"><strong>{name}</strong><small>{detail}</small></span>;
+}
+
+function displayRank(rows: Recommendation[], index: number) {
+  if (index === 0) return "1";
+  const displayedValue = rows[index].payout_equity.toFixed(4);
+  const firstEqual = rows.findIndex((row) => row.payout_equity.toFixed(4) === displayedValue);
+  return firstEqual < index ? `T${firstEqual + 1}` : String(index + 1);
 }

@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 fantasy-backtest = "fantasy_model.backtest:main"
+fantasy-calibrate = "fantasy_model.distribution_calibration:main"
 fantasy-draft = "fantasy_model.draft_day:main"
 fantasy-kalshi = "fantasy_model.kalshi:main"
 fantasy-kalshi-backtest = "fantasy_model.kalshi_backtest:main"

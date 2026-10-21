@@ -1,9 +1,15 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
-from fantasy_model.draft_day import apply_manual_picks, draft_state, update_xouts
+from fantasy_model.draft_day import (
+    _simulation_board,
+    apply_manual_picks,
+    draft_state,
+    update_xouts,
+)
 from fantasy_model.league import LeagueSnapshot
 from test_league import _draft_payload, _league_payload
 
@@ -58,3 +64,29 @@ def test_xouts_require_exact_names_and_persist(tmp_path: Path) -> None:
     assert update_xouts(path, _projections(), [], ["p2"]) == set()
     with pytest.raises(ValueError, match="Unknown X-out"):
         update_xouts(path, _projections(), ["Maye"], [])
+
+
+def test_simulation_board_order_is_stable_for_seeded_shocks() -> None:
+    projections = pl.DataFrame(
+        {
+            "mfl_player_id": ["p3", "p1", "p2"],
+            "name": ["Three", "One", "Two"],
+            "position": ["WR", "QB", "RB"],
+            "source": ["veteran_recency_shrink"] * 3,
+            "mean_season_points": [100.0, 200.0, 150.0],
+            "sd_season_points": [30.0, 40.0, 35.0],
+            "adp": [3.0, 1.0, 2.0],
+            "adp_rank": [3, 1, 2],
+        }
+    )
+    snapshot = SimpleNamespace(
+        drafted_player_ids=frozenset(),
+        rostered_player_ids=frozenset(),
+        external_picks=(),
+        external_rostered_player_ids=frozenset(),
+    )
+    first, _, _ = _simulation_board(projections, snapshot, set())
+    second, _, _ = _simulation_board(projections.reverse(), snapshot, set())
+
+    assert [row["id"] for row in first] == ["p1", "p2", "p3"]
+    assert first == second

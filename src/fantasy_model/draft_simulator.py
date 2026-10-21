@@ -18,6 +18,8 @@ from .utility import PayoutStructure, optimal_week_score
 
 
 POSITIONS = ("QB", "RB", "WR", "TE", "PK", "DEF")
+SKILL_POSITIONS = ("RB", "WR", "TE")
+STARTING_SKILL_PLAYERS = 8
 
 
 def _position(value: Any) -> str:
@@ -123,6 +125,7 @@ class DraftSimulationConfig:
     adp_noise: float = 0.38
     max_candidates: int = 16
     payout_field_size: int = 20
+    antithetic_sampling: bool = True
     payout: PayoutStructure = field(default_factory=PayoutStructure)
     roster_rules: RosterRules = field(default_factory=RosterRules)
 
@@ -150,6 +153,9 @@ class CandidateEV:
     second_probability: float
     third_probability: float
     availability_probability: float
+    marginal_ev_standard_error: float
+    best_ev_gap_standard_error: float
+    statistically_tied_for_best: bool
 
 
 @dataclass(frozen=True)
@@ -182,6 +188,15 @@ class _Equity:
     third: float
     availability: float
     most_common_player_id: str
+    payout_samples: tuple[float, ...]
+
+
+def _paired_standard_error(first: _Equity, second: _Equity) -> float:
+    """Monte Carlo error for a difference under common random numbers."""
+    differences = np.asarray(first.payout_samples) - np.asarray(second.payout_samples)
+    if differences.size < 2:
+        return 0.0
+    return float(np.std(differences, ddof=1) / sqrt(differences.size))
 
 
 def _board_rows(board: Any) -> list[Mapping[str, Any]]:
@@ -208,6 +223,10 @@ class DraftSimulator:
         user_franchise: str,
         *,
         exclusions: Iterable[str] = (),
+        user_exclusions: Iterable[str] = (),
+        external_draft_slots: Sequence[DraftSlot | Mapping[str, Any]] = (),
+        external_franchises: Sequence[str] = (),
+        external_exclusions: Iterable[str] = (),
         config: DraftSimulationConfig = DraftSimulationConfig(),
     ) -> None:
         self.players = tuple(DraftPlayer.from_mapping(row) for row in _board_rows(player_board))
@@ -232,15 +251,59 @@ class DraftSimulator:
         if any(slot.overall <= 0 for slot in self.slots):
             raise ValueError("Overall picks must be positive")
 
+        self.external_franchises = tuple(
+            str(franchise) for franchise in external_franchises
+        )
+        self.external_slots = tuple(
+            sorted(
+                (DraftSlot.from_value(slot) for slot in external_draft_slots),
+                key=lambda slot: slot.overall,
+            )
+        )
+        if bool(self.external_franchises) != bool(self.external_slots):
+            raise ValueError(
+                "External conference franchises and draft slots must be supplied together"
+            )
+        if self.external_franchises:
+            expected_external = config.payout_field_size - len(self.franchises)
+            if (
+                len(self.external_franchises) != expected_external
+                or len(set(self.external_franchises)) != expected_external
+                or set(self.external_franchises) & set(self.franchises)
+            ):
+                raise ValueError("External conference franchises must complete the payout field")
+            if len({slot.overall for slot in self.external_slots}) != len(
+                self.external_slots
+            ):
+                raise ValueError("External draft order must contain unique overall picks")
+            if any(
+                slot.franchise_id not in self.external_franchises
+                for slot in self.external_slots
+            ):
+                raise ValueError("External draft order contains an unknown franchise")
+
         self.config = config
         self.exclusions = frozenset(str(player_id) for player_id in exclusions)
+        self.user_exclusions = frozenset(
+            str(player_id) for player_id in user_exclusions
+        )
+        self.external_exclusions = frozenset(
+            str(player_id) for player_id in external_exclusions
+        )
         self._player_index = {
             player.player_id: index for index, player in enumerate(self.players)
         }
+        all_franchises = (*self.franchises, *self.external_franchises)
         self._franchise_index = {
-            franchise: index for index, franchise in enumerate(self.franchises)
+            franchise: index for index, franchise in enumerate(all_franchises)
         }
-        self._conditioned_rosters, self._conditioned_ids = self._condition_existing_picks()
+        self._conditioned_rosters, self._conditioned_ids = self._condition_picks(
+            self.slots, self.franchises
+        )
+        (
+            self._external_conditioned_rosters,
+            self._external_conditioned_ids,
+        ) = self._condition_picks(self.external_slots, self.external_franchises)
         # PRE_DRAFT and WAITING are valid states: opponents ahead of the user's
         # next pick are simulated rather than requiring the user to be on clock.
         self.current_slot = next(
@@ -254,16 +317,34 @@ class DraftSimulator:
         if self.current_slot is None:
             raise ValueError("The user franchise has no unfilled picks")
 
-        self._unfilled_after = self._count_unfilled_after()
-        self._validate_roster_capacity()
+        self._unfilled_after = self._count_unfilled_after(self.slots)
+        self._external_unfilled_after = self._count_unfilled_after(
+            self.external_slots
+        )
+        self._validate_roster_capacity(
+            self.franchises,
+            self.slots,
+            self._conditioned_rosters,
+        )
+        if self.external_franchises:
+            self._validate_roster_capacity(
+                self.external_franchises,
+                self.external_slots,
+                self._external_conditioned_rosters,
+            )
         self._replacement_points = self._calculate_replacement_points()
         self._scenarios = self._make_scenarios()
         self._equity_cache: dict[str | None, _Equity] = {}
+        self._external_score_rows: tuple[dict[str, float], ...] | None = None
 
-    def _condition_existing_picks(self) -> tuple[dict[str, list[str]], frozenset[str]]:
-        rosters = {franchise: [] for franchise in self.franchises}
+    def _condition_picks(
+        self,
+        slots: Sequence[DraftSlot],
+        franchises: Sequence[str],
+    ) -> tuple[dict[str, list[str]], frozenset[str]]:
+        rosters = {franchise: [] for franchise in franchises}
         drafted: set[str] = set()
-        for slot in self.slots:
+        for slot in slots:
             if slot.player_id is None:
                 continue
             if slot.player_id not in self.player_by_id:
@@ -274,38 +355,61 @@ class DraftSimulator:
             drafted.add(slot.player_id)
         return rosters, frozenset(drafted)
 
-    def _count_unfilled_after(self) -> dict[int, int]:
+    def _count_unfilled_after(
+        self, slots: Sequence[DraftSlot]
+    ) -> dict[int, int]:
         result: dict[int, int] = {}
-        for slot in self.slots:
+        for slot in slots:
             result[slot.overall] = sum(
                 later.player_id is None
                 and later.overall > slot.overall
                 and later.franchise_id == slot.franchise_id
-                for later in self.slots
+                for later in slots
             )
         return result
 
-    def _validate_roster_capacity(self) -> None:
-        minimum_total = sum(self.config.roster_rules.minimums.values())
-        for franchise in self.franchises:
-            total_slots = sum(slot.franchise_id == franchise for slot in self.slots)
+    def _validate_roster_capacity(
+        self,
+        franchises: Sequence[str],
+        slots: Sequence[DraftSlot],
+        conditioned_rosters: Mapping[str, Sequence[str]],
+    ) -> None:
+        minimum_total = STARTING_SKILL_PLAYERS + sum(
+            self.config.roster_rules.minimums[position]
+            for position in ("QB", "PK", "DEF")
+        )
+        for franchise in franchises:
+            total_slots = sum(slot.franchise_id == franchise for slot in slots)
             if total_slots < minimum_total:
                 raise ValueError(
                     f"Franchise {franchise} has {total_slots} picks but needs {minimum_total} positions"
                 )
             existing = Counter(
                 self.player_by_id[player_id].position
-                for player_id in self._conditioned_rosters[franchise]
+                for player_id in conditioned_rosters[franchise]
             )
             remaining = sum(
-                slot.player_id is None and slot.franchise_id == franchise for slot in self.slots
+                slot.player_id is None and slot.franchise_id == franchise for slot in slots
             )
-            deficit = sum(
-                max(0, self.config.roster_rules.minimums[position] - existing[position])
-                for position in POSITIONS
-            )
+            deficit = self._minimum_picks_needed(existing)
             if deficit > remaining:
                 raise ValueError(f"Existing picks make {franchise}'s roster infeasible")
+
+    def _minimum_picks_needed(self, counts: Counter[str]) -> int:
+        fixed_deficit = sum(
+            max(0, self.config.roster_rules.minimums[position] - counts[position])
+            for position in ("QB", "PK", "DEF")
+        )
+        skill_position_deficit = sum(
+            max(0, self.config.roster_rules.minimums[position] - counts[position])
+            for position in SKILL_POSITIONS
+        )
+        skill_total_deficit = max(
+            0,
+            STARTING_SKILL_PLAYERS
+            - sum(counts[position] for position in SKILL_POSITIONS),
+        )
+        return fixed_deficit + max(skill_position_deficit, skill_total_deficit)
 
     def _calculate_replacement_points(self) -> dict[str, float]:
         # Expected starter demand in the league's flexible lineup: a neutral
@@ -327,27 +431,64 @@ class DraftSimulator:
 
     def _make_scenarios(self) -> tuple[_Scenario, ...]:
         rng = np.random.default_rng(self.config.seed)
-        return tuple(
-            _Scenario(
-                draft_noise=rng.normal(
-                    0.0,
-                    self.config.adp_noise,
-                    size=(len(self.franchises), len(self.players)),
-                ),
-                outcome_z=rng.standard_normal(len(self.players)),
-                external_scenario_indices=rng.integers(
-                    0,
-                    self.config.simulations,
-                    size=self.config.payout_field_size - len(self.franchises),
-                ),
-                external_opponent_indices=rng.integers(
-                    0,
-                    len(self.franchises) - 1,
-                    size=self.config.payout_field_size - len(self.franchises),
-                ),
+        scenarios: list[_Scenario] = []
+
+        def external_field_indices(scenario_index: int) -> tuple[np.ndarray, np.ndarray]:
+            count = self.config.payout_field_size - len(self.franchises)
+            # Evenly rotate through independent scenario/team combinations.
+            # This stratifies the unknown conference rather than adding another
+            # noisy bootstrap draw to an already finite Monte Carlo estimate.
+            sources = np.asarray(
+                [
+                    (
+                        scenario_index
+                        + ((field_index + 1) * self.config.simulations) // (count + 1)
+                    )
+                    % self.config.simulations
+                    for field_index in range(count)
+                ],
+                dtype=int,
             )
-            for _ in range(self.config.simulations)
-        )
+            opponents = np.asarray(
+                [
+                    (scenario_index + field_index) % (len(self.franchises) - 1)
+                    for field_index in range(count)
+                ],
+                dtype=int,
+            )
+            return sources, opponents
+
+        while len(scenarios) < self.config.simulations:
+            draft_noise = rng.normal(
+                0.0,
+                self.config.adp_noise,
+                size=(len(self._franchise_index), len(self.players)),
+            )
+            outcome_z = rng.standard_normal(len(self.players))
+            external_scenario_indices, external_opponent_indices = (
+                external_field_indices(len(scenarios))
+            )
+            scenarios.append(
+                _Scenario(
+                    draft_noise=draft_noise,
+                    outcome_z=outcome_z,
+                    external_scenario_indices=external_scenario_indices,
+                    external_opponent_indices=external_opponent_indices,
+                )
+            )
+            if self.config.antithetic_sampling and len(scenarios) < self.config.simulations:
+                external_scenario_indices, external_opponent_indices = (
+                    external_field_indices(len(scenarios))
+                )
+                scenarios.append(
+                    _Scenario(
+                        draft_noise=-draft_noise,
+                        outcome_z=-outcome_z,
+                        external_scenario_indices=external_scenario_indices,
+                        external_opponent_indices=external_opponent_indices,
+                    )
+                )
+        return tuple(scenarios)
 
     def _feasible(
         self,
@@ -368,10 +509,7 @@ class DraftSimulator:
             return False
         counts = counts.copy()
         counts[position] += 1
-        deficit = sum(
-            max(0, self.config.roster_rules.minimums[position] - counts[position])
-            for position in POSITIONS
-        )
+        deficit = self._minimum_picks_needed(counts)
         return deficit <= picks_after
 
     def _available(
@@ -379,13 +517,18 @@ class DraftSimulator:
         selected_ids: set[str],
         roster_ids: Sequence[str],
         picks_after: int,
+        *,
+        for_user: bool = False,
+        exclusions: frozenset[str] | None = None,
     ) -> list[DraftPlayer]:
         counts = Counter(self.player_by_id[player_id].position for player_id in roster_ids)
+        blocked = self.exclusions if exclusions is None else exclusions
         return [
             player
             for player in self.players
             if player.player_id not in selected_ids
-            and player.player_id not in self.exclusions
+            and player.player_id not in blocked
+            and (not for_user or player.player_id not in self.user_exclusions)
             and self._feasible_with_counts(player.position, counts, picks_after)
         ]
 
@@ -401,7 +544,9 @@ class DraftSimulator:
         roster_ids: Sequence[str],
         picks_after: int,
     ) -> DraftPlayer:
-        available = self._available(selected_ids, roster_ids, picks_after)
+        available = self._available(
+            selected_ids, roster_ids, picks_after, for_user=True
+        )
         if not available:
             raise RuntimeError("No feasible player remains for the user roster")
         return max(available, key=self._draft_value)
@@ -413,8 +558,15 @@ class DraftSimulator:
         roster_ids: Sequence[str],
         picks_after: int,
         scenario: _Scenario,
+        *,
+        exclusions: frozenset[str] | None = None,
     ) -> DraftPlayer:
-        available = self._available(selected_ids, roster_ids, picks_after)
+        available = self._available(
+            selected_ids,
+            roster_ids,
+            picks_after,
+            exclusions=exclusions,
+        )
         if not available:
             raise RuntimeError(f"No feasible player remains for {franchise}")
         franchise_index = self._franchise_index[franchise]
@@ -447,6 +599,7 @@ class DraftSimulator:
                 and forced_candidate_id is not None
                 and forced_candidate_id not in selected_ids
                 and forced_candidate_id not in self.exclusions
+                and forced_candidate_id not in self.user_exclusions
             ):
                 player = self.player_by_id[forced_candidate_id]
                 if not self._feasible(player, roster, picks_after):
@@ -466,6 +619,28 @@ class DraftSimulator:
             if slot.overall == self.current_slot.overall:
                 current_selection = player.player_id
         return rosters, current_selection
+
+    def _draft_external(self, scenario: _Scenario) -> dict[str, list[str]]:
+        rosters = {
+            franchise: list(player_ids)
+            for franchise, player_ids in self._external_conditioned_rosters.items()
+        }
+        selected_ids = set(self._external_conditioned_ids)
+        for slot in self.external_slots:
+            if slot.player_id is not None:
+                continue
+            roster = rosters[slot.franchise_id]
+            player = self._choose_opponent(
+                slot.franchise_id,
+                selected_ids,
+                roster,
+                self._external_unfilled_after[slot.overall],
+                scenario,
+                exclusions=self.external_exclusions,
+            )
+            roster.append(player.player_id)
+            selected_ids.add(player.player_id)
+        return rosters
 
     @staticmethod
     def _sample_player(player: DraftPlayer, z_score: float) -> float:
@@ -494,6 +669,19 @@ class DraftSimulator:
         # of season outcomes, applied identically to every franchise.
         return optimal_week_score(outcomes)
 
+    def _exact_external_scores(self) -> tuple[dict[str, float], ...]:
+        if not self.external_franchises:
+            return ()
+        if self._external_score_rows is None:
+            self._external_score_rows = tuple(
+                {
+                    franchise: self._roster_score(roster, scenario.outcome_z)
+                    for franchise, roster in self._draft_external(scenario).items()
+                }
+                for scenario in self._scenarios
+            )
+        return self._external_score_rows
+
     def _equity(self, forced_candidate_id: str | None) -> _Equity:
         if forced_candidate_id in self._equity_cache:
             return self._equity_cache[forced_candidate_id]
@@ -515,20 +703,28 @@ class DraftSimulator:
         opponent_franchises = tuple(
             franchise for franchise in self.franchises if franchise != self.user_franchise
         )
+        exact_external_scores = self._exact_external_scores()
+        payout_samples: list[float] = []
         for index, scenario in enumerate(self._scenarios):
             scores = score_rows[index]
             our_score = scores[self.user_franchise]
             conference_opponents = [scores[franchise] for franchise in opponent_franchises]
-            external_opponents = [
-                score_rows[int(source_index)][
-                    opponent_franchises[int(opponent_index)]
+            if exact_external_scores:
+                external_opponents = [
+                    exact_external_scores[index][franchise]
+                    for franchise in self.external_franchises
                 ]
-                for source_index, opponent_index in zip(
-                    scenario.external_scenario_indices,
-                    scenario.external_opponent_indices,
-                    strict=True,
-                )
-            ]
+            else:
+                external_opponents = [
+                    score_rows[int(source_index)][
+                        opponent_franchises[int(opponent_index)]
+                    ]
+                    for source_index, opponent_index in zip(
+                        scenario.external_scenario_indices,
+                        scenario.external_opponent_indices,
+                        strict=True,
+                    )
+                ]
             opponents = [*conference_opponents, *external_opponents]
             # Exact ties split each occupied finishing place fairly. This is
             # mostly relevant to deterministic test projections.
@@ -541,11 +737,13 @@ class DraftSimulator:
             first_total += first_share
             second_total += second_share
             third_total += third_share
-            payout_total += (
+            scenario_payout = (
                 first_share * self.config.payout.first
                 + second_share * self.config.payout.second
                 + third_share * self.config.payout.third
             )
+            payout_total += scenario_payout
+            payout_samples.append(scenario_payout)
         denominator = self.config.simulations
         result = _Equity(
             payout=payout_total / denominator,
@@ -554,6 +752,7 @@ class DraftSimulator:
             third=third_total / denominator,
             availability=available_total / denominator,
             most_common_player_id=current_selections.most_common(1)[0][0],
+            payout_samples=tuple(payout_samples),
         )
         self._equity_cache[forced_candidate_id] = result
         return result
@@ -561,7 +760,9 @@ class DraftSimulator:
     def _initial_selectable(self) -> list[DraftPlayer]:
         roster = self._conditioned_rosters[self.user_franchise]
         picks_after = self._unfilled_after[self.current_slot.overall]
-        return self._available(set(self._conditioned_ids), roster, picks_after)
+        return self._available(
+            set(self._conditioned_ids), roster, picks_after, for_user=True
+        )
 
     def reference_player(self) -> DraftPlayer:
         """Player selected now by the projection/VORP completion policy."""
@@ -581,6 +782,7 @@ class DraftSimulator:
         reference = self._equity(None)
         equity = self._equity(player_id)
         player = self.player_by_id[player_id]
+        marginal_se = _paired_standard_error(equity, reference)
         return CandidateEV(
             rank=1,
             player_id=player.player_id,
@@ -593,6 +795,9 @@ class DraftSimulator:
             second_probability=equity.second,
             third_probability=equity.third,
             availability_probability=equity.availability,
+            marginal_ev_standard_error=marginal_se,
+            best_ev_gap_standard_error=0.0,
+            statistically_tied_for_best=True,
         )
 
     def rank_candidates(
@@ -636,6 +841,7 @@ class DraftSimulator:
             (player, self._equity(player.player_id)) for player in candidates
         ]
         raw.sort(key=lambda item: (-item[1].payout, item[0].adp, item[0].player_id))
+        best_equity = raw[0][1]
         ranked = tuple(
             CandidateEV(
                 rank=rank,
@@ -649,6 +855,13 @@ class DraftSimulator:
                 second_probability=equity.second,
                 third_probability=equity.third,
                 availability_probability=equity.availability,
+                marginal_ev_standard_error=_paired_standard_error(equity, reference),
+                best_ev_gap_standard_error=(
+                    best_gap_se := _paired_standard_error(equity, best_equity)
+                ),
+                statistically_tied_for_best=(
+                    best_equity.payout - equity.payout <= 1.96 * best_gap_se
+                ),
             )
             for rank, (player, equity) in enumerate(raw, start=1)
         )
@@ -659,7 +872,11 @@ class DraftSimulator:
             reference_player_id=reference.most_common_player_id,
             reference_payout_equity=reference.payout,
             payout_field_size=self.config.payout_field_size,
-            field_approximation="bootstrap_external_teams_from_conference_opponents",
+            field_approximation=(
+                "exact_two_conference_drafts_shared_player_outcomes"
+                if self.external_franchises
+                else "stratified_external_teams_from_conference_opponents"
+            ),
             candidates=ranked,
         )
 
@@ -671,6 +888,10 @@ def rank_draft_candidates(
     user_franchise: str,
     *,
     exclusions: Iterable[str] = (),
+    user_exclusions: Iterable[str] = (),
+    external_draft_slots: Sequence[DraftSlot | Mapping[str, Any]] = (),
+    external_franchises: Sequence[str] = (),
+    external_exclusions: Iterable[str] = (),
     candidate_ids: Sequence[str] | None = None,
     config: DraftSimulationConfig = DraftSimulationConfig(),
 ) -> DraftEVRanking:
@@ -681,5 +902,9 @@ def rank_draft_candidates(
         franchises,
         user_franchise,
         exclusions=exclusions,
+        user_exclusions=user_exclusions,
+        external_draft_slots=external_draft_slots,
+        external_franchises=external_franchises,
+        external_exclusions=external_exclusions,
         config=config,
     ).rank_candidates(candidate_ids)

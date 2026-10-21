@@ -28,6 +28,7 @@ test("ships a populated static fallback contract and no starter preview", async 
   );
   assert.equal(payload.report.franchise, "Levered Leopolds");
   assert.equal(payload.draft_order.length, 160);
+  assert.equal(payload.external_draft_order.length, 160);
   assert.ok(payload.players.length > 500);
   assert.ok(payload.report.recommendations.length > 0);
   await assert.rejects(
@@ -39,4 +40,8 @@ test("ships a populated static fallback contract and no starter preview", async 
   assert.match(page, /Record pick/);
   assert.match(page, /Recompute EV/);
   assert.match(page, /Absolute odds remain uncalibrated/);
+  assert.match(page, /Prize EV/);
+  assert.match(page, /Availability/);
+  assert.match(page, /available now/);
+  assert.match(page, /toFixed\(2\)/);
 });

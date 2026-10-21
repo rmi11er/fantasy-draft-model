@@ -258,7 +258,9 @@ def _simulation_board(
         pl.coalesce("adp", "adp_rank", pl.lit(9999.0)).cast(pl.Float64).alias("sim_adp")
     ).to_dicts()
     by_id = {str(row["mfl_player_id"]): row for row in all_rows}
-    drafted = snapshot.drafted_player_ids
+    drafted = snapshot.drafted_player_ids | frozenset(
+        pick.player_id for pick in snapshot.external_picks if pick.player_id
+    )
     missing_drafted = sorted(drafted - set(by_id))
     if missing_drafted:
         raise ValueError(
@@ -284,7 +286,9 @@ def _simulation_board(
     selected_ids |= set(required_ids)
 
     board: list[dict[str, Any]] = []
-    for player_id in selected_ids:
+    # Stable ordering is part of seeded reproducibility: simulator shock arrays
+    # are indexed by this board order, and Python set iteration varies by process.
+    for player_id in sorted(selected_ids):
         row = by_id[player_id]
         board.append(
             {
@@ -300,9 +304,9 @@ def _simulation_board(
     # A rostered/keeper player is unavailable even if MFL draftResults does not
     # list it. Current live rosters are empty; its value is not yet conditioned
     # into the simulator, so surface that approximation explicitly.
-    unavailable = set(snapshot.rostered_player_ids) | xouts
+    unavailable = set(snapshot.rostered_player_ids)
     warnings: list[str] = []
-    if snapshot.rostered_player_ids:
+    if snapshot.rostered_player_ids or snapshot.external_rostered_player_ids:
         warnings.append(
             "Keeper/roster players are excluded, but their points are not yet "
             "conditioned into simulated roster strength"
@@ -329,6 +333,34 @@ def _draft_slots(snapshot: LeagueSnapshot) -> list[dict[str, Any]]:
         }
         for pick in snapshot.picks
         if pick.player_id or (not pick.processed and pick.overall >= current_overall)
+    ]
+
+
+def _external_draft_slots(snapshot: LeagueSnapshot) -> list[dict[str, Any]]:
+    if not snapshot.external_picks:
+        return []
+    processed_indexes = [
+        index for index, pick in enumerate(snapshot.external_picks) if pick.processed
+    ]
+    next_index = max(processed_indexes, default=-1) + 1
+    current_overall = (
+        snapshot.external_picks[next_index].overall
+        if next_index < len(snapshot.external_picks)
+        else None
+    )
+    return [
+        {
+            "overall": pick.overall,
+            "franchise_id": pick.franchise_id,
+            "player_id": pick.player_id,
+        }
+        for pick in snapshot.external_picks
+        if pick.player_id
+        or (
+            current_overall is not None
+            and not pick.processed
+            and pick.overall >= current_overall
+        )
     ]
 
 
@@ -370,7 +402,7 @@ def _format_report(
     records: list[dict[str, Any]] = []
     for candidate in ranking.candidates[:top]:
         projection = projection_by_id[candidate.player_id]
-        variance = (
+        payout_variance = (
             0.49 * candidate.first_probability
             + 0.04 * candidate.second_probability
             + 0.01 * candidate.third_probability
@@ -393,7 +425,9 @@ def _format_report(
                 "mean_season_points": projection["mean_season_points"],
                 "sd_season_points": projection["sd_season_points"],
                 "projection_source": projection["source"],
-                "mc_standard_error": sqrt(max(variance, 0.0) / ranking.simulations),
+                "payout_mc_standard_error": sqrt(
+                    max(payout_variance, 0.0) / ranking.simulations
+                ),
                 "why": explanation,
                 **market,
             }
@@ -441,20 +475,23 @@ def _print_report(report: dict[str, Any]) -> None:
         f"{100 * report['reference_payout_equity']:.2f}% payout equity"
     )
     print()
-    print(" #  Player                    Pos Team  ADP  Avail   EV     ΔEV   1st/2nd/3rd")
+    print(" #  Player                    Pos Team  ADP  Avail   EV     ΔEV±SE       Tier")
     for row in report["recommendations"]:
         print(
             f"{row['rank']:>2}  {row['name'][:25]:<25} "
             f"{row['position']:<3} {str(row['team'] or 'FA'):<4} "
             f"{row['adp']:>5.1f} {100 * row['availability_probability']:>5.1f}% "
             f"{100 * row['payout_equity']:>6.2f}% "
-            f"{100 * row['marginal_ev']:>+6.2f}pp "
-            f"{100 * row['first_probability']:>4.1f}/"
-            f"{100 * row['second_probability']:>4.1f}/"
-            f"{100 * row['third_probability']:>4.1f}"
+            f"{100 * row['marginal_ev']:>+6.2f}±"
+            f"{100 * row['marginal_ev_standard_error']:<4.2f}pp "
+            f"{'TOP' if row['statistically_tied_for_best'] else ''}"
         )
     if report["recommendations"]:
         print(f"\nWhy #1: {report['recommendations'][0]['why']}")
+        print(
+            "Tier: TOP means the candidate is not distinguishable from the "
+            "simulated leader at 95% using paired Monte Carlo error."
+        )
     for warning in report["warnings"]:
         print(f"WARNING: {warning}")
 
@@ -544,12 +581,23 @@ def main() -> None:
         warnings.append("Fail-closed mode: verify MFL before acting on this board")
     if candidates and len(candidates) > args.max_candidates:
         raise ValueError("Explicit candidate count exceeds --max-candidates")
+    external_slots = _external_draft_slots(snapshot)
+    external_franchises = (
+        snapshot.external_conference_franchise_ids if external_slots else ()
+    )
     ranking = rank_draft_candidates(
         board,
         _draft_slots(snapshot),
         snapshot.conference_franchise_ids,
         snapshot.franchise_id,
         exclusions=unavailable,
+        user_exclusions=xouts,
+        external_draft_slots=external_slots,
+        external_franchises=external_franchises,
+        external_exclusions=(
+            (unavailable - snapshot.rostered_player_ids)
+            | snapshot.external_rostered_player_ids
+        ),
         candidate_ids=candidates,
         config=DraftSimulationConfig(
             simulations=args.simulations,
@@ -602,6 +650,16 @@ def main() -> None:
                     "player_id": pick.player_id,
                 }
                 for pick in snapshot.picks
+            ],
+            "external_draft_order": [
+                {
+                    "overall": pick.overall,
+                    "round": pick.round,
+                    "slot": pick.slot,
+                    "franchise_id": pick.franchise_id,
+                    "player_id": pick.player_id,
+                }
+                for pick in snapshot.external_picks
             ],
             "players": web_players,
             "xouts": sorted(xouts),
